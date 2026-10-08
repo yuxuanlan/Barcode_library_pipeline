@@ -1,0 +1,873 @@
+---
+title: "Detect RNA barcodes using cellbarcode package on plate1-6 data: "
+date: "2025-09-17"
+author: "Yuxuan Lan"
+output: html_document
+html_document: default
+pdf_document: default
+---
+
+# V3: this is based on run_CellBarcode.v2.Rmd.
+
+This version uses plate+wellid UMI and constant + barcode patterns.
+
+Detect and cluster barcodes for whole plate. Results go under ./run2/
+
+filter clustered bc using first 4 bcs && count>well[bc_clustered.reads]/50
+
+V2: this is based on test_CellBarcode.v2.Rmd.
+
+This version uses plate+wellid UMI and constant + barcode patterns.
+
+Detect and cluster barcodes for whole plate. Results go under ./run1/
+
+filter clustered bc using stdr>4 && count>well[bc_clustered.reads]/10
+
+Prepare package for usage
+
+```{r}
+# if (!require("BiocManager", quietly = TRUE))
+#     install.packages("BiocManager")
+# BiocManager::install("CellBarcode")
+rm(list=ls())
+library(CellBarcode)
+library(magrittr)
+library(stringr)
+library(stringdist)
+# install.packages("data.table") # for testing cellbarcode
+library(data.table)
+library(Biostrings)
+source('/Users/lany/mount_drives/HPC_Projects/0/0ddcec61-75f4-4347-b696-e96ec587183c/data/results/YL/PIP-3583/Software/CellBarcode-v1.13.2/method-extract_barcode.yl1.R')
+library(ggplot2)
+#Clear out R before starting anything
+
+fastq_dir="/Users/lany/mount_drives/HPC_Projects/0/0ddcec61-75f4-4347-b696-e96ec587183c/data/results/YL/PIP-3583/Reads/Raw_merged/"
+analysis_root <- "/Users/lany/mount_drives/HPC_Projects/0/0ddcec61-75f4-4347-b696-e96ec587183c/data/results/YL/PIP-3583/Analysis/CellBarcode_3.22/plate_UMI_constant/run2"
+
+plateid <- "plate1"
+# this stores all process status for each well
+plate_stats <- c()
+# overwrite==T will generate the files again.
+overwrite=F
+```
+
+# 1. read samplesheet for sample tags and constants
+
+## 1.1 read samplesheet
+
+```{r}
+csvfile <- sprintf('/Users/lany/mount_drives/HPC_Projects/0/0ddcec61-75f4-4347-b696-e96ec587183c/data/results/YL/PIP-3583/Analysis/Barcode_analysis/UMIs.v2/%s.unix.csv',plateid)
+df.csv <- read.csv(csvfile, header = T, sep = ',')
+df.csv <- df.csv[,-c(1)]
+colnames(df.csv) <- c('wellid', 'sample_tag1', 'const1', 'sample_tag2', 'const2')
+
+```
+
+# 2. Run pipeline following similar steps to YL's homebrew pipelines. Check outputs at each step.
+
+## 2.1 aerosal filter to remove reads cov\<2
+
+load single fastq file, remove aerosal contaminant with cov=1;
+
+```{r}
+if (plateid!='plate6'){
+  fq_files <- file.path(fastq_dir,sprintf('%s_merged.fastq.gz', plateid))
+} else {
+  fq_files <- file.path(fastq_dir,'plate6fullLIBk562_merged.fastq.gz')
+}
+barcode_df.raw = read_fastq_gz(fq_files)
+
+# 599,983 uniq reads
+print(dim(barcode_df.raw))
+# [1] 599983      2
+plate_stats[['raw_reads_uniq']] <- dim(barcode_df.raw)[1]
+# total input reads: 5,603,546
+sum(barcode_df.raw$freq)
+# [1] 5603546
+plate_stats[['raw_reads']] <- sum(barcode_df.raw$freq)
+
+# remove cov<2: remove 376,906
+sum(barcode_df.raw$freq<=1)
+
+# after filtering: 143,625 uniq reads, total 5,226,640 reads.
+barcode_df <- barcode_df.raw[barcode_df.raw$freq>1,]
+dim(barcode_df)
+# [1] 223077      2
+plate_stats[['raw_read_cov>1_uniq']] <- dim(barcode_df)[1]
+sum(barcode_df$freq)
+plate_stats[['raw_read_cov>1']] <- sum(barcode_df$freq)
+rm(barcode_df.raw)
+```
+
+## 2.2 detect unique reads matching sample_tags, constants and bc pattern backbones.
+
+```{r}
+well_stats <- c()
+for (csv_row in 1:nrow(df.csv)){
+  ### 2.2.1 select a well to analysis
+  process_stats <- c()
+  # sample_tag1 = "AGACCGTGA"
+  # sample_tag2 = "GTAGCACAG" # plate1_A1
+  # const1 = 'GGCCTCTTCCGCGTCTTC'
+  # const2 = "GGGAGGGGCAAACAACAGA"
+  wellid <- df.csv[csv_row,1]
+  sample_tag1 <- df.csv[csv_row,2]
+  const1 <- toupper(df.csv[csv_row,3])
+  sample_tag2 <- df.csv[csv_row,4]
+  const2 <- df.csv[csv_row,5]
+  sample_tag2.rc <- as.character(reverseComplement(DNAString(x=sample_tag2)))
+  const2.rc = toupper(as.character(reverseComplement(DNAString(x=const2))))
+  # barcode only pattern
+  # pattern = "GCTC([ACTG]{3})CAG([ACTG]{3})GTT([ACTG]{3})ACT([ACTG]{3})CTC([ACTG]{3})AGG([ACTG]{3})GAC([ACTG]{3})GAGCGGT"
+  pattern.read = paste(sample_tag1,const1,"(.*)GCTC([ACTG]{3})CAG([ACTG]{3})GTT([ACTG]{3})ACT([ACTG]{3})CTC([ACTG]{3})AGG([ACTG]{3})GAC([ACTG]{3})GAGCGGT(.*)",const2.rc,sample_tag2.rc,sep = "")
+  process_stats[['wellid']] <- wellid
+  
+  ### 2.2.2: fwd reads
+  matched_reads.fwd <- bc_extract_df(barcode_df, pattern.read, maxLDist = 0)
+  
+  process_stats[['fwd.match_reads']] <- sum(matched_reads.fwd$count)
+
+  process_stats[['fwd.match_reads_uniq']] <- dim(matched_reads.fwd)[1]
+
+
+  ### 2.2.3 rev reads
+  rc <- as.character(reverseComplement(DNAStringSet(x=barcode_df$seq)))
+  barcode_df.rc = barcode_df
+  barcode_df.rc$seq= rc
+  
+  matched_reads.rc <- bc_extract_df(barcode_df.rc, pattern.read, maxLDist = 0)
+  # 913 unique reads in well, total 38,039 reads.
+  # sum(matched_reads.rc$count)
+  # 38039
+  process_stats[['rc.match_reads']] <- sum(matched_reads.rc$count)
+  
+  # dim(matched_reads.rc)
+  # [1] 913   2
+  process_stats[['rc.match_reads_uniq']] <- dim(matched_reads.rc)[1]
+
+  ### 2.2.4. merge fwd + rc reads
+  matched_reads.merged <- merge(matched_reads.fwd, matched_reads.rc, by.x="barcode_seq", by.y="barcode_seq", all.x=T, all.y=T)
+  matched_reads.merged$count.x[is.na(matched_reads.merged$count.x)]=0
+  matched_reads.merged$count.y[is.na(matched_reads.merged$count.y)]=0
+  matched_reads.merged$count.fwdrc <- matched_reads.merged$count.x + matched_reads.merged$count.y
+  matched_reads.merged <- matched_reads.merged[order(matched_reads.merged$count.fwdrc, decreasing = T),]
+  process_stats[['fwdrc.match_reads']]=sum(matched_reads.merged$count.fwdrc)
+  
+  # dim(matched_reads.merged)
+  # [1] 1215    4
+  process_stats[['fwdrc.match_reads_uniq']] = dim(matched_reads.merged)[1]
+  # matched_reads.merged[1,]
+  #                                                                                                                                                                                       barcode_seq
+  #                                                                                                                                                                                            <char>
+  # 1: AGACCGTGAGGCCTCTTCCGCGTCTTCGCCTTCGCCCTCAGACGAGTCGGATCTCCCTTTGGGCCGCCTCCCCGCCTTTGCTAGTCTACGCTCTGGCAGTGCGTTAAGACTTTGCTCGTTAGGATGGACTTGGAGCGGTCTGTGCCTTCTAGTTGCCAGCCATCTGTTGTTTGCCCCTCCCCTGTGCTAC
+  #    count.x count.y count.fwdrc
+  #      <num>   <num>       <num>
+  # 1:    9493   10359       19852
+
+  ### 2.2.5 extract exact matching barcodes from merged reads
+  # We expect each read contains a valid barcode.
+
+  matched_reads.merged <- matched_reads.merged[,c('barcode_seq', "count.fwdrc")]
+  colnames(matched_reads.merged) <- c('seq','freq')
+  # input detected reads for barcode detection
+  pattern.bc = "GCTC([ACTG]{3})CAG([ACTG]{3})GTT([ACTG]{3})ACT([ACTG]{3})CTC([ACTG]{3})AGG([ACTG]{3})GAC([ACTG]{3})GAGCGGT"
+  df.bc_backbone <- bc_extract_df(matched_reads.merged, pattern.bc, maxLDist = 0)
+    #                                           barcode_seq count
+    #                                                <char> <num>
+    # 1: GCTCTGGCAGTGCGTTAAGACTTTGCTCGTTAGGATGGACTTGGAGCGGT 21928
+    # 2: GCTCCAGCAGCTAGTTTCGACTTCTCTCATAAGGTTAGACAATGAGCGGT 16935
+  process_stats[['match_bc.reads']] <- sum(df.bc_backbone$count)
+  
+  # found 555 barcodes before clustering
+  # dim(df.bc_backbone)
+  # [1] 555   2
+  process_stats[['match_bc.bcs']] <- dim(df.bc_backbone)[1]
+  # output reads and counts as csv.
+  if (! overwrite){
+    if(!dir.exists(sprintf('%s/bc_extract/%s', analysis_root,plateid))){
+      dir.create(sprintf('%s/bc_extract/%s', analysis_root,plateid), recursive = T)
+    }
+    
+    write.csv(df.bc_backbone, 
+              file=sprintf('%s/bc_extract/%s/%s.bc.csv', analysis_root,plateid,wellid),
+              row.names = F)
+  }
+
+  ### 2.2.7 cluster similar barcodes together - add read counts of similar barcodes.
+  # This one is correct!
+  # compute levenshtein distance
+  df.ld <- data.frame(lapply(df.bc_backbone$barcode_seq, function(x){stringdist(df.bc_backbone$barcode_seq, x, method = 'lv')} ))
+  colnames(df.ld) <- 1:dim(df.bc_backbone)[1]
+  # df.ld[1:3,1:3]
+  #    1  2  3
+  # 1  0 16 13
+  # 2 16  0 16
+  # 3 13 16  0
+
+  # now merge:
+
+  # the sequences are already in descending order of the count, so it is safe to merge
+  bc_cluster.count <- c()
+  bc_cluster.bc <- c()
+  
+  # start with all barcodes, end of each search set count for merged barcode to 0
+  df.bc_backbone2 = df.bc_backbone
+  for (row in 1:dim(df.ld)[1]){
+    current_bc <- df.bc_backbone2$barcode_seq[row]
+    if (df.bc_backbone2$count[row]>0){
+      idx_to_merge <- which(df.ld[row,]<=1)
+      bc_cluster.count <- c(bc_cluster.count, sum(df.bc_backbone2$count[idx_to_merge]))
+      bc_cluster.bc <- c(bc_cluster.bc, current_bc)
+      df.bc_backbone2$count[idx_to_merge] = 0
+    } 
+  }
+  
+  df.bc_clustered <- data.frame(barcode_seq = bc_cluster.bc, count = bc_cluster.count)
+  # sum(df.bc_clustered$count)
+  df.bc_clustered <- df.bc_clustered[order(df.bc_clustered$count, decreasing = T),]
+  # sum(df.bc_clustered$count)
+  # [1] 71928
+  process_stats[['bc_clustered.reads']] <- sum(df.bc_clustered$count)
+
+  # barcodes after filtering: 372
+  # dim(df.bc_clustered)
+  # [1] 372   2
+  process_stats[['bc_clustered.bc']] <- dim(df.bc_clustered)[1]
+  rm(df.bc_backbone2)
+  
+  # output reads and counts as csv.
+  if (! overwrite){
+    if(!dir.exists(sprintf('%s/bc_cluster/%s', analysis_root,plateid))){
+      dir.create(sprintf('%s/bc_cluster/%s', analysis_root,plateid), recursive = T)
+    }
+    write.csv(df.bc_clustered, 
+              file=sprintf('%s/bc_cluster/%s/%s.bc.csv', analysis_root,plateid,wellid),
+              row.names = F)
+  }
+  ### 2.2.9 filter barcodes, take first 4 barcodes
+  t=4
+  bc_threshold = process_stats[['bc_clustered.reads']]/50
+  # 7192.8
+  
+  # fit glm model
+  # glm.read_freq <- glm(y~x, data=data.frame(x=1:nrow(df.bc_clustered), y=df.bc_clustered$count), family = "gaussian")
+  # stdres <- rstandard(glm.read_freq)
+  
+  # idx for potential bcs: any with count above threshold
+  potential_bc <- which(df.bc_clustered$count>=bc_threshold)
+  # take top 4 as barcode 
+  if (length(potential_bc)>=t){
+    bc_idx <- potential_bc[1:t] 
+  } else {
+    bc_idx <- potential_bc
+  }
+  
+  # plot stdr4 filtered on read counts
+  if (! overwrite){
+    p <- ggplot(data=data.frame(read_freq=df.bc_clustered$count, x=1:nrow(df.bc_clustered)), 
+                aes(y=read_freq, x=x))+geom_point(alpha=0.5)
+    p <- p + geom_point(data=data.frame(read_freq=df.bc_clustered$count[bc_idx], 
+                                        x=1:length(bc_idx)),
+                        aes(y=read_freq, x=x), color='red') + 
+      ggtitle(sprintf('nb_bc: %d', length(bc_idx)))
+    
+    barcodeplot_dir <- sprintf('%s/bc_filter/plots/%s.stdr4', analysis_root,plateid)
+    if(!dir.exists(barcodeplot_dir)){
+      dir.create(barcodeplot_dir, recursive = T)
+    }
+    ggsave(sprintf('%s/%s.Ld_stdr4.pdf', barcodeplot_dir, wellid), 
+             p, width = 10, height = 10, units = 'cm')
+  }
+  # plot filtering to get potential bcs
+  if ( overwrite) {
+    p <- ggplot(data=data.frame(read_freq=df.bc_clustered$count, x=1:nrow(df.bc_clustered)), 
+                aes(y=read_freq, x=x))+geom_point(alpha=0.5)
+    p <- p + geom_point(data=data.frame(read_freq=df.bc_clustered$count[potential_bc], 
+                                        x=1:length(potential_bc)),
+                        aes(y=read_freq, x=x), color='red') + 
+      ggtitle(sprintf('nb_bc: %d', length(potential_bc)))
+    
+    barcodeplot_dir <- sprintf('%s/bc_filter/plots/%s.potential_bc', analysis_root,plateid)
+    if(!dir.exists(barcodeplot_dir)){
+      dir.create(barcodeplot_dir, recursive = T)
+    }
+    ggsave(sprintf('%s/%s.Ld_potential_bc.pdf', barcodeplot_dir, wellid), 
+             p, width = 10, height = 10, units = 'cm')
+  }
+  # output filtered bc list
+  if (!overwrite){ 
+    if(!dir.exists(sprintf('%s/bc_filter/%s', analysis_root,plateid))){
+      dir.create(sprintf('%s/bc_filter/%s', analysis_root,plateid), recursive = T)
+    }
+    write.table(x=df.bc_clustered[bc_idx,], 
+                file = sprintf('%s/bc_filter/%s/%s.bc.filtered.csv', analysis_root,plateid,wellid), 
+                col.names = T, sep = ',',
+                row.names = F, quote = F)
+    # output potential bc list
+    write.table(x=df.bc_clustered[potential_bc,], 
+                file = sprintf('%s/bc_filter/%s/%s.bc.potential.csv', analysis_root,plateid,wellid), 
+                col.names = T, sep = ',',
+                row.names = F, quote = F)
+  }
+  # update stats
+  tmp <- df.bc_clustered[bc_idx,]
+  process_stats[['bc_filtered.bc']] <- dim(tmp)[1]
+  process_stats[['bc_filtered.reads']] <- sum(tmp$count)
+  process_stats[['bc_filtered.seq']] <- tmp$barcode_seq
+  process_stats[['bc_filtered.seq_freq']] <- tmp$count
+  tmp <- df.bc_clustered[potential_bc,]
+  process_stats[['bc_potential.bc']] <- dim(tmp)[1]
+  process_stats[['bc_potential.reads']] <- sum(tmp$count)
+  process_stats[['bc_potential.seq']] <- tmp$barcode_seq
+  process_stats[['bc_potential.seq_freq']] <- tmp$count
+  well_stats[[wellid]] <- process_stats
+}
+```
+
+save stats as Rdata object
+
+```{r}
+save(well_stats, plate_stats, 
+     file=sprintf('%s/bc_cluster/%s.well_stats.RData', analysis_root,plateid))
+```
+## 2.3 remove wells with matched_reads<10k
+```{r}
+load(file=sprintf('%s/bc_cluster/%s.well_stats.RData', analysis_root,plateid), verbose = T)
+wells_to_remove.match_reads <- c()
+for (stat in well_stats){
+  if (stat[["fwdrc.match_reads"]]<10000){
+      wells_to_remove.match_reads <- c(wells_to_remove.match_reads, stat[['wellid']])
+  }
+}
+well_stats <- well_stats[! names(well_stats) %in% wells_to_remove.match_reads]
+```
+## 2.4 check for within the plate jumping barcode on filtered barcodes
+```{r}
+df.filtered_bcs <- data.frame(bc=character(0), wellid=character(0))
+for (stat in well_stats){
+  for (bc in stat[['bc_filtered.seq']]) {
+    df.filtered_bcs[nrow(df.filtered_bcs)+1,] <- c(bc, stat[['wellid']])
+  }
+}
+
+# make df with duplicated barcodes removed
+uniq_bcs <- unique(df.filtered_bcs$bc)
+df.filtered_bcs.2 <- data.frame(bc=unique(df.filtered_bcs$bc))
+df.filtered_bcs.2$in_num_wells <- unlist(lapply(df.filtered_bcs.2$bc, 
+                                                FUN=function(x) sum(df.filtered_bcs$bc==x)))
+df.filtered_bcs.2$in_wells <- unlist(lapply(df.filtered_bcs.2$bc, 
+       FUN=function(x) paste0(df.filtered_bcs$wellid[df.filtered_bcs$bc==x], collapse = ':')))
+# output dup barcode csv
+write.csv(df.filtered_bcs.2, 
+          file=sprintf('%s/bc_filter/%s.per_plate_dup_filtered_bc.1.csv', analysis_root,plateid),
+          row.names = F)
+wells_to_remove.per_plate_dup_filtered_bc <- unique(unlist(lapply(df.filtered_bcs.2$in_wells[df.filtered_bcs.2$in_num_wells>1], 
+                                           FUN = function(x) unlist(str_split(x, pattern = ":")))))
+# output list of wells
+write.table(wells_to_remove.per_plate_dup_filtered_bc, 
+          file=sprintf('%s/bc_filter/%s.wells_with_dup_filtered_bc.csv', analysis_root,plateid),
+          row.names = F, col.names = F)
+
+```
+## 2.5 check for within the plate jumping barcode on potential barcodes - use this to remove wells
+```{r}
+df.filtered_bcs <- data.frame(bc=character(0), wellid=character(0))
+for (stat in well_stats){
+  for (bc in stat[['bc_potential.seq']]) {
+    df.filtered_bcs[nrow(df.filtered_bcs)+1,] <- c(bc, stat[['wellid']])
+  }
+}
+
+# make df with duplicated barcodes removed
+uniq_bcs <- unique(df.filtered_bcs$bc)
+df.filtered_bcs.2 <- data.frame(bc=unique(df.filtered_bcs$bc))
+df.filtered_bcs.2$in_num_wells <- unlist(lapply(df.filtered_bcs.2$bc, 
+                                                FUN=function(x) sum(df.filtered_bcs$bc==x)))
+df.filtered_bcs.2$in_wells <- unlist(lapply(df.filtered_bcs.2$bc, 
+       FUN=function(x) paste0(df.filtered_bcs$wellid[df.filtered_bcs$bc==x], collapse = ':')))
+# output dup barcode csv
+write.csv(df.filtered_bcs.2, 
+          file=sprintf('%s/bc_filter/%s.per_plate_dup_potential_bc.1.csv', analysis_root,plateid),
+          row.names = F)
+wells_to_remove.per_plate_dup_potential_bc <- unique(unlist(lapply(df.filtered_bcs.2$in_wells[df.filtered_bcs.2$in_num_wells>1], 
+                                           FUN = function(x) unlist(str_split(x, pattern = ":")))))
+# output list of wells
+write.table(wells_to_remove.per_plate_dup_potential_bc, 
+          file=sprintf('%s/bc_filter/%s.wells_with_dup_potential_bc.csv', analysis_root,plateid),
+          row.names = F)
+
+```
+
+## 2.6 check for between plate jumping barcodes 
+### 2.6.1 for filtered barcodes
+```{r}
+plateid <- "plate1"
+# this stores all filtered barcodes across plates
+df.filtered_bcs <- data.frame(bc=character(0), wellid=character(0))
+for (plateid in c("plate1", "plate2", "plate3", "plate4", "plate5")) {
+  load(file=sprintf('%s/bc_cluster/%s.well_stats.RData', analysis_root,plateid), verbose = T)
+  
+  wells_to_remove.dup_filtered_bc <-
+    unlist(as.list(read.csv(file=sprintf('%s/bc_filter/%s.wells_with_dup_filtered_bc.csv',
+                        analysis_root, plateid), header = F)))
+  if (file.size(sprintf('%s/bc_extract/%s.wells_under_10k.csv',
+                        analysis_root, plateid))!=0L){
+      wells_to_remove.match_reads <-
+      unlist(as.list(read.csv(file=sprintf('%s/bc_extract/%s.wells_under_10k.csv',
+                        analysis_root, plateid), header = F)))
+  } else {
+    wells_to_remove.match_reads <- c()
+  }
+  # remove within plate dup wells
+  well_stats <- well_stats[!(names(well_stats) %in%
+                               c(wells_to_remove.dup_filtered_bc,wells_to_remove.match_reads))]
+
+  
+  for (stat in well_stats){
+    for (bc in stat[['bc_filtered.seq']]) {
+      df.filtered_bcs[nrow(df.filtered_bcs)+1,] <- c(bc, stat[['wellid']])
+    }
+  }
+}
+
+# list between plate jumping barcodes
+uniq_bcs <- unique(df.filtered_bcs$bc)
+df.filtered_bcs.2 <- data.frame(bc=unique(df.filtered_bcs$bc))
+df.filtered_bcs.2$in_num_wells <- unlist(lapply(df.filtered_bcs.2$bc, 
+                                                FUN=function(x) sum(df.filtered_bcs$bc==x)))
+df.filtered_bcs.2$in_wells <- unlist(lapply(df.filtered_bcs.2$bc, 
+       FUN=function(x) paste0(df.filtered_bcs$wellid[df.filtered_bcs$bc==x], collapse = ':')))
+
+# output dup barcode csv
+write.csv(df.filtered_bcs.2, 
+          file=sprintf('%s/plate1-5.between_plate_dup_filtered_bc.1.csv', analysis_root),
+          row.names = F)
+
+wells_to_remove.between_plate_dup_filtered_bc <- sort(unique(unlist(lapply(df.filtered_bcs.2$in_wells[df.filtered_bcs.2$in_num_wells>1], 
+                                           FUN = function(x) unlist(str_split(x, pattern = ":"))))))
+write.table(wells_to_remove.between_plate_dup_filtered_bc, 
+          file=sprintf('%s/plate1-5.wells_with_dup_filtered_bc.csv', analysis_root),
+          row.names = F, col.names = F)
+
+# output final barcodes after between plate dedup
+df.filtered_bcs.2 <- df.filtered_bcs.2[df.filtered_bcs.2$in_num_wells==1,]
+df.filtered_bcs.2 <- df.filtered_bcs.2[
+  !(df.filtered_bcs.2$in_wells %in% wells_to_remove.between_plate_dup_filtered_bc), ]
+df.filtered_bcs.2 <- df.filtered_bcs.2[,-c(2)]
+colnames(df.filtered_bcs.2) <- c("bc", "wellid")
+write.table(df.filtered_bcs.2, 
+          file=sprintf('%s/plate1-5.final_bc_filtered.csv', analysis_root),
+          sep = ',', row.names = F, col.names = F)
+
+```
+### 2.6.2 for potential barcodes
+```{r}
+plateid <- "plate1"
+# this stores all potential barcodes across plates
+df.potential_bcs <- data.frame(bc=character(0), wellid=character(0))
+for (plateid in c("plate1", "plate2", "plate3", "plate4", "plate5")) {
+  load(file=sprintf('%s/bc_cluster/%s.well_stats.RData', analysis_root,plateid), verbose = T)
+  
+  wells_to_remove.dup_potential_bc <-
+    unlist(as.list(read.csv(file=sprintf('%s/bc_filter/%s.wells_with_dup_potential_bc.csv',
+                        analysis_root, plateid), header = F)))
+  if (file.size(sprintf('%s/bc_extract/%s.wells_under_10k.csv',
+                        analysis_root, plateid))!=0L){
+      wells_to_remove.match_reads <-
+      unlist(as.list(read.csv(file=sprintf('%s/bc_extract/%s.wells_under_10k.csv',
+                        analysis_root, plateid), header = F)))
+  } else {
+    wells_to_remove.match_reads <- c()
+  }
+  # remove within plate dup wells
+  well_stats <- well_stats[!(names(well_stats) %in%
+                               c(wells_to_remove.dup_potential_bc,wells_to_remove.match_reads))]
+
+  
+  for (stat in well_stats){
+    for (bc in stat[['bc_potential.seq']]) {
+      df.potential_bcs[nrow(df.potential_bcs)+1,] <- c(bc, stat[['wellid']])
+    }
+  }
+}
+
+# list between plate jumping barcodes
+uniq_bcs <- unique(df.potential_bcs$bc)
+df.potential_bcs.2 <- data.frame(bc=unique(df.potential_bcs$bc))
+df.potential_bcs.2$in_num_wells <- unlist(lapply(df.potential_bcs.2$bc, 
+                                                FUN=function(x) sum(df.potential_bcs$bc==x)))
+df.potential_bcs.2$in_wells <- unlist(lapply(df.potential_bcs.2$bc, 
+       FUN=function(x) paste0(df.potential_bcs$wellid[df.potential_bcs$bc==x], collapse = ':')))
+
+# output dup barcode csv
+write.csv(df.potential_bcs.2, 
+          file=sprintf('%s/plate1-5.between_plate_dup_potential_bc.1.csv', analysis_root),
+          row.names = F)
+
+wells_to_remove.between_plate_dup_potential_bc <- sort(unique(unlist(lapply(df.potential_bcs.2$in_wells[df.potential_bcs.2$in_num_wells>1], 
+                                           FUN = function(x) unlist(str_split(x, pattern = ":"))))))
+write.table(wells_to_remove.between_plate_dup_potential_bc, 
+          file=sprintf('%s/plate1-5.wells_with_dup_potential_bc.csv', analysis_root),
+          row.names = F, col.names = F)
+
+# output final barcodes after between plate dedup
+df.potential_bcs.2 <- df.potential_bcs.2[df.potential_bcs.2$in_num_wells==1,]
+df.potential_bcs.2 <- df.potential_bcs.2[
+  !(df.potential_bcs.2$in_wells %in% wells_to_remove.between_plate_dup_potential_bc), ]
+
+df.potential_bcs.2 <- df.potential_bcs.2[,-c(2)]
+colnames(df.potential_bcs.2) <- c("bc", "wellid")
+write.table(df.potential_bcs.2, 
+          file=sprintf('%s/plate1-5.final_bc_potential.csv', analysis_root),
+          sep = ',', row.names = F, col.names = F)
+
+```
+## 3. Make summary and log files:
+
+1. plate level per stage summary, filter at read matching stage, removing any well\<10,000
+
+2. list of barcodes after barcode merging 
+
+3. csv file showing the number of reads and bcs in each well after barcode merging
+
+```{r}
+# 1. plate level per stage summary, 
+plate_csv <- sprintf('%s/%s.process.csv', analysis_root, plateid)
+if (file.exists(plate_csv)){
+  file.remove(plate_csv); 
+  file.create(plate_csv);
+}
+fh <- file(plate_csv)
+
+load(file=sprintf('%s/bc_cluster/%s.well_stats.RData', analysis_root,plateid), verbose = T)
+well_stats <- well_stats[! names(well_stats) %in% wells_to_remove.match_reads]
+
+# write header:
+header="merged_reads,uniq,cov>1,cov>1_uniq,type,match_reads,uniq,match_reads.wells,match_reads.remove_wells,match_bc.reads,match_bc.bc,cluster_bc.reads,cluster_bc.bc,filter_bc.reads,filter_bc.bc,dedup_filtered_bc.bc,dedup_filtered_bc.reads,dedup_filter_bc.wells,dedup_potential_bc.bc,dedup_potential_bc.reads,dedup_potential_bc.wells"
+# add raw read info
+str1 <- sprintf('%d,%d,%d,%d', plate_stats[['raw_reads']],plate_stats[['raw_reads_uniq']],
+               plate_stats[['raw_read_cov>1']],plate_stats[['raw_read_cov>1_uniq']] )
+
+# add fwd matched read info
+reads <- 0
+reads_uniq <- 0
+for (stat in well_stats){
+  reads <- reads+stat[["fwd.match_reads"]]
+  reads_uniq <- reads_uniq+stat[["fwd.match_reads_uniq"]]
+  
+}
+str1 <- sprintf('%s,fwd,%d,%d,', str1,reads,reads_uniq)
+
+# add rc matched read info
+reads <- 0
+reads_uniq <- 0
+for (stat in well_stats){
+  reads <- reads+stat[["rc.match_reads"]]
+  reads_uniq <- reads_uniq+stat[["rc.match_reads_uniq"]]
+  
+}
+str2 <- sprintf(',,,,rc,%d,%d,,,,,,,,,',reads,reads_uniq)
+
+# add fwdrc matched read info
+reads <- 0
+reads_uniq <- 0
+for (stat in well_stats){
+  reads <- reads+stat[["fwdrc.match_reads"]]
+  reads_uniq <- reads_uniq+stat[["fwdrc.match_reads_uniq"]]
+}
+str3 <- sprintf(',,,,fwdrc,%d,%d,,,,,,,,,',reads,reads_uniq)
+
+# add info on removed wells.
+if (plateid!="plate6"){
+  str1 <- sprintf('%s%d,%s', str1, 96-length(wells_to_remove.match_reads),
+                paste(wells_to_remove.match_reads,collapse =  ':'))
+} else{
+str1 <- sprintf('%s%d,%s', str1, 48-length(wells_to_remove.match_reads),
+                paste(wells_to_remove.match_reads,collapse =  ':'))}
+
+# add matched_bc info
+# add rc matched read info
+reads <- 0
+bcs <- 0
+for (stat in well_stats){
+  reads <- reads+stat[["match_bc.reads"]]
+  bcs <- bcs+stat[["match_bc.bcs"]]
+  
+}
+str1 <- sprintf('%s,%d,%d',str1,reads,bcs)
+
+# add clustered_bc info
+reads <- 0
+bcs <- 0
+for (stat in well_stats){
+  reads <- reads+stat[["bc_clustered.reads"]]
+  bcs <- bcs+stat[["bc_clustered.bc"]]
+  
+}
+str1 <- sprintf('%s,%d,%d',str1,reads,bcs)
+
+# add merged_bc info
+reads <- 0
+bcs <- 0
+for (stat in well_stats){
+  reads <- reads+stat[["bc_filtered.reads"]]
+  bcs <- bcs+stat[["bc_filtered.bc"]]
+  
+}
+str1 <- sprintf('%s,%d,%d',str1,reads,bcs)
+
+# add within plate dedup barcode info
+# remove dup filtered barcodes
+well_stats <- well_stats[! names(well_stats) %in% wells_to_remove.per_plate_dup_filtered_bc]
+reads <- 0
+bcs <- 0
+for (stat in well_stats){
+  reads <- reads+stat[["bc_filtered.reads"]]
+  bcs <- bcs+stat[["bc_filtered.bc"]]
+}
+str1 <- sprintf('%s,%d,%d,%d',str1,bcs,reads,length(well_stats))
+
+# remove dup potential barcodes
+well_stats <- well_stats[! names(well_stats) %in% wells_to_remove.per_plate_dup_potential_bc]
+reads <- 0
+bcs <- 0
+for (stat in well_stats){
+  reads <- reads+stat[["bc_potential.reads"]]
+  bcs <- bcs+stat[["bc_potential.bc"]]
+}
+str1 <- sprintf('%s,%d,%d,%d',str1,bcs,reads,length(well_stats))
+
+writeLines(c(header,str1,str2,str3), con = fh)
+close(fh)
+```
+2. list of barcodes after barcode merging and dedup
+
+deduped filtered barcodes:
+```{r}
+load(file=sprintf('%s/bc_cluster/%s.well_stats.RData', analysis_root,plateid), verbose = T)
+well_stats <- well_stats[! (names(well_stats) %in% wells_to_remove.per_plate_dup_filtered_bc |
+                           names(well_stats) %in% wells_to_remove.match_reads)]
+
+
+plate_csv <- sprintf('%s/%s.bc_dedup_filtered_bc.csv', analysis_root, plateid)
+if (file.exists(plate_csv)){
+  file.remove(plate_csv); 
+  file.create(plate_csv);
+}
+str_csv <- ""
+fh <- file(plate_csv)
+for (stat in well_stats){
+  # read per well csv
+  # print(stat[['wellid']])
+  filtered_csv <- sprintf('%s/bc_filter/%s/%s.bc.filtered.csv', analysis_root, plateid,stat[['wellid']])
+  l <- readLines(con = file(filtered_csv))
+  # write to bc_dedup.csv, skipping first line, and appending wellid
+  if (length(l)>2){
+    str_csv <- sprintf('%s%s,%s\n',
+                       str_csv,paste0(l[2:length(l)], collapse = sprintf(',%s\n',stat[['wellid']])),
+                       stat[['wellid']])
+  } else{
+    str_csv <- sprintf('%s%s,%s\n',str_csv,l[2],stat[['wellid']])
+  }
+  
+  writeLines(str_csv, con = fh)
+}
+close(fh)
+```
+output deduped potential barcodes:
+```{r}
+load(file=sprintf('%s/bc_cluster/%s.well_stats.RData', analysis_root,plateid), verbose = T)
+well_stats <- well_stats[! (names(well_stats) %in% wells_to_remove.per_plate_dup_potential_bc |
+                           names(well_stats) %in% wells_to_remove.match_reads)]
+
+
+plate_csv <- sprintf('%s/%s.bc_dedup_potential_bc.csv', analysis_root, plateid)
+if (file.exists(plate_csv)){
+  file.remove(plate_csv); 
+  file.create(plate_csv);
+}
+str_csv <- ""
+fh <- file(plate_csv)
+for (stat in well_stats){
+  # read per well csv
+  # print(stat[['wellid']])
+  filtered_csv <- sprintf('%s/bc_filter/%s/%s.bc.potential.csv', analysis_root, plateid,stat[['wellid']])
+  l <- readLines(con = file(filtered_csv))
+  # write to bc_dedup.csv, skipping first line, and appending wellid
+  if (length(l)>2){
+    str_csv <- sprintf('%s%s,%s\n',
+                       str_csv,paste0(l[2:length(l)], collapse = sprintf(',%s\n',stat[['wellid']])),
+                       stat[['wellid']])
+  } else{
+    str_csv <- sprintf('%s%s,%s\n',str_csv,l[2],stat[['wellid']])
+  }
+  
+  writeLines(str_csv, con = fh)
+}
+close(fh)
+```
+## 4. csv file showing between plate barcode dedup output
+```{r}
+# 1. plate level per stage summary, 
+plateid="plate1"
+for (plateid in c("plate1", "plate2", "plate3", "plate4", "plate5")) {
+  plate_csv <- sprintf('%s/%s.between_plate_dedup.csv', analysis_root, plateid)
+  if (file.exists(plate_csv)){
+    file.remove(plate_csv); 
+    file.create(plate_csv);
+  }
+  fh <- file(plate_csv)
+  
+  # wells to remove:
+  load(file=sprintf('%s/bc_cluster/%s.well_stats.RData', analysis_root,plateid), verbose = T)
+  wells_to_remove.dup_filtered_bc <-
+    unlist(as.list(read.csv(file=sprintf('%s/bc_filter/%s.wells_with_dup_filtered_bc.csv',
+                        analysis_root, plateid), header = F)))
+  if (file.size(sprintf('%s/bc_extract/%s.wells_under_10k.csv',
+                        analysis_root, plateid))!=0L){
+      wells_to_remove.match_reads <-
+      unlist(as.list(read.csv(file=sprintf('%s/bc_extract/%s.wells_under_10k.csv',
+                        analysis_root, plateid), header = F)))
+  } else {
+    wells_to_remove.match_reads <- c()
+  }
+  between_plate.wells_to_remove.dup_filtered_bc <-
+    unlist(as.list(read.csv(file=sprintf('%s/plate1-5.wells_with_dup_filtered_bc.csv',
+                        analysis_root), header = F)))
+  # remove within plate dup wells
+  well_stats <- well_stats[!(names(well_stats) %in%
+                               c(wells_to_remove.dup_filtered_bc,wells_to_remove.match_reads, 
+                                 between_plate.wells_to_remove.dup_filtered_bc))]
+  
+  # write header:
+  header="plate,dedup2_filtered_bc.bc,dedup2_filtered_bc.reads,dedup2_filtered_bc.wells,dedup2_potential_bc.bc,dedup2_potential_bc.reads,dedup2_potential_bc.wells,"
+  
+  # add between plate dedup filtered bc infos
+  reads <- 0
+  bcs <- 0
+  for (stat in well_stats){
+    reads <- reads+stat[["bc_filtered.reads"]]
+    bcs <- bcs+stat[["bc_filtered.bc"]]
+  }
+  str1 <- plateid
+  str1 <- sprintf('%s,%d,%d,%d',str1,bcs,reads,length(well_stats))
+  
+  # load potential dup barcodes 
+  load(file=sprintf('%s/bc_cluster/%s.well_stats.RData', analysis_root,plateid), verbose = T)
+  wells_to_remove.dup_potential_bc <-
+    unlist(as.list(read.csv(file=sprintf('%s/bc_filter/%s.wells_with_dup_potential_bc.csv',
+                        analysis_root, plateid), header = F)))
+  if (file.size(sprintf('%s/bc_extract/%s.wells_under_10k.csv',
+                        analysis_root, plateid))!=0L){
+      wells_to_remove.match_reads <-
+      unlist(as.list(read.csv(file=sprintf('%s/bc_extract/%s.wells_under_10k.csv',
+                        analysis_root, plateid), header = F)))
+  } else {
+    wells_to_remove.match_reads <- c()
+  }
+  between_plate.wells_to_remove.dup_potential_bc <-
+    unlist(as.list(read.csv(file=sprintf('%s/plate1-5.wells_with_dup_potential_bc.csv',
+                        analysis_root), header = F)))
+  # remove within and between plate dup wells
+  well_stats <- well_stats[!(names(well_stats) %in%
+                               c(wells_to_remove.dup_potential_bc,wells_to_remove.match_reads, 
+                                 between_plate.wells_to_remove.dup_potential_bc))]
+  
+  # add between plate dedup potential bc infos
+  reads <- 0
+  bcs <- 0
+  for (stat in well_stats){
+    reads <- reads+stat[["bc_potential.reads"]]
+    bcs <- bcs+stat[["bc_potential.bc"]]
+  }
+  str1 <- sprintf('%s,%d,%d,%d',str1,bcs,reads,length(well_stats))
+  writeLines(c(header,str1), con = fh)
+  close(fh)
+}
+```
+
+## 5. DO NOT DO THIS.
+This comparison is not necessary.
+compare plate1 - plate5 final barcode list of CellBarcode pipeline to YL pipeline num 1
+load final barcodes from both pipelines; load list of removed wells from cellbarcode pipeline
+```{r}
+df.bc1 <- read.csv(file="/Users/lany/mount_drives/HPC_Projects/0/0ddcec61-75f4-4347-b696-e96ec587183c/data/results/YL/PIP-3583/Analysis/Barcode_analysis/run2/Ld/barcode.final.allplates.csv",
+                   sep = ',', header = T)
+# read current final list bcs
+df.bc2 <- read.csv(file.path(analysis_root, 'plate1-5.final_bc_filtered.csv'), 
+         sep = ',', header = F )
+colnames(df.bc2) <- c('barcode', 'wellid')
+
+wells_to_remove_allplates.within_plate_dup_filtered_bc <- c()
+for (plateid in c("plate1", "plate2", "plate3", "plate4", "plate5")) {
+  wells_to_remove_allplates.within_plate_dup_filtered_bc <- c(wells_to_remove_allplates.within_plate_dup_filtered_bc,
+                                                      read.csv(sprintf('%s/bc_filter/%s.wells_with_dup_filtered_bc.csv',
+                                                                       analysis_root,plateid), header = F)$V1)
+}
+
+wells_to_remove_allplates.between_plate_dup_filtered_bc <- 
+  read.csv(sprintf('%s/plate1-5.wells_with_dup_filtered_bc.csv',analysis_root), header = F)$V1
+
+wells_to_remove_allplates.match_reads <- c()
+for (plateid in c("plate1", "plate2", "plate3", "plate4", "plate5")) {
+  if (file.size(sprintf('%s/bc_extract/%s.wells_under_10k.csv',
+                          analysis_root, plateid))!=0L){
+        wells_to_remove_allplates.match_reads <- c(wells_to_remove_allplates.match_reads, 
+          unlist(as.list(read.csv(file=sprintf('%s/bc_extract/%s.wells_under_10k.csv',
+                            analysis_root, plateid), header = F))))
+    }
+}
+```
+### 5.1 how many final wells are the same?
+```{r}
+logfile <- sprintf('%s/compare_to_YLpipeline1/compare_to_YLpipeline1.log', analysis_root)
+if (file.exists(logfile)){
+  file.remove(logfile); 
+  file.create(logfile);
+}
+fh <- file(logfile)
+  
+str1 <- sprintf('YL pipeline1: wells - %d, barcodes - %d\n', 
+              length(unique(df.bc1$wellid)), length(unique(df.bc1$barcode)))
+str1 <- sprintf('%sCellBarcode pipeline: wells - %d, barcodes - %d\n\n',str1,
+              length(unique(df.bc2$wellid)), length(unique(df.bc2$barcode)) )
+
+# wells in only pipeline1: 24
+uniq_wells <- setdiff(unique(df.bc1$wellid), unique(df.bc2$wellid))
+
+# how are these wells removed from cellbarcodes? 
+# 21 wells are within plate dup 
+sum(uniq_wells %in% wells_to_remove_allplates.within_plate_dup_filtered_bc)
+# 3 are between plate dup
+sum(uniq_wells %in% wells_to_remove_allplates.between_plate_dup_filtered_bc)
+
+str1 <- sprintf('%swells unique in pipeline1: %d;\n',
+                str1,length(uniq_wells))
+
+# str1 <- sprintf('%s%s\n',str1, 
+#                 paste0(unname(apply(df.bc1[df.bc1$wellid %in% uniq_wells,], 1, FUN=function(x) paste0(x, collapse = ','))), collapse = "\n"))
+str1 <- sprintf('%s%s\n',str1, paste0(uniq_wells, collapse = ','))
+str1 <- sprintf('%sAll above were removed by cellbarcode as within plate duplication - cellbarcode tends to call more barcodes hence more duplication', str1)
+
+# wells in only cellbarcode  
+uniq_wells <- setdiff(unique(df.bc2$wellid), unique(df.bc1$wellid))
+
+
+writeLines(str1, fh)
+
+close(fh)
+```
+
+## 6. jumping barcode csv using potential barcodes: this will be passed on to Biofoundry
+make csv for within plate jumping barcode in format of "barcode_seq,count,wellid,"; 
+make sure the identical barcodes appear together.
+```{r}
+# load potential bc csv with dup labelled
+plateid <- 'plate1'
+df.bc <- read.csv(sprintf('%s/bc_filter/%s.per_plate_dup_potential_bc.1.csv', 
+                 analysis_root, plateid), header = T)
+df.bc <- df.bc[df.bc$in_num_wells>1,]
+row <- 1
+in_wells <- unlist(str_split(df.bc$in_wells[row], pattern = ':'))
+
+```

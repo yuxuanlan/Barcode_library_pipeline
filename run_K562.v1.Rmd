@@ -1,0 +1,253 @@
+---
+title: "Detect RNA barcodes using cellbarcode package on plate6 k562 data: "
+date: "2025-10-01"
+author: "Yuxuan Lan"
+output: html_document
+html_document: default
+pdf_document: default
+---
+
+# V1: this is based on run_CellBarcode.v3.Rmd.
+
+This version uses plate+wellid UMI and constant + barcode patterns.
+
+Detect and cluster barcodes for whole plate. Results go under ./k562/run1/
+
+call bc_extract_df() with default maxLDist=0. This only detect barcodes with full match to pattern.
+
+Modified and re-ran: 05-Oct-2026
+Prepare package for usage
+
+```{r}
+# if (!require("BiocManager", quietly = TRUE))
+#     install.packages("BiocManager")
+# BiocManager::install("CellBarcode")
+rm(list=ls())
+library(CellBarcode)
+library(magrittr)
+library(stringr)
+library(stringdist)
+# install.packages("data.table") # for testing cellbarcode
+library(data.table)
+library(Biostrings)
+# load modified version of CellBarcode
+source('/Users/lany/mount_drives/HPC_Projects/0/0ddcec61-75f4-4347-b696-e96ec587183c/data/results/YL/PIP-3583/Software/CellBarcode-v1.13.2/method-extract_barcode.yl1.R')
+library(ggplot2)
+#Clear out R before starting anything
+
+fastq_dir="/Users/lany/mount_drives/HPC_Projects/0/0ddcec61-75f4-4347-b696-e96ec587183c/data/results/YL/PIP-3583/Reads/Raw_merged/"
+analysis_root <- "/Users/lany/mount_drives/HPC_Projects/0/0ddcec61-75f4-4347-b696-e96ec587183c/data/results/YL/PIP-3583/Analysis/CellBarcode_3.22/plate_UMI_constant/"
+
+plateid <- "k562"
+# this stores all process status for each well
+plate_stats <- c()
+OUTPUT=F
+```
+
+# 1. read samplesheet for sample tags and constants
+
+## 1.1 read samplesheet
+
+```{r}
+csvfile <- sprintf('/Users/lany/mount_drives/HPC_Projects/0/0ddcec61-75f4-4347-b696-e96ec587183c/data/results/YL/PIP-3583/Analysis/Barcode_analysis/UMIs.v2/%s.unix.csv',plateid)
+df.csv <- read.csv(csvfile, header = T, sep = ',')
+df.csv <- df.csv[,-c(1)]
+colnames(df.csv) <- c('wellid', 'sample_tag1', 'const1', 'sample_tag2', 'const2')
+
+```
+
+# 2. Run pipeline following similar steps to YL's homebrew pipelines. Check outputs at each step.
+
+## 2.1 aerosal filter to remove reads cov<2
+
+load single fastq file, remove aerosal contaminant with cov=1;
+
+```{r}
+if (plateid=='plate6' | plateid=='k562'){
+  fq_files <- file.path(fastq_dir,'plate6fullLIBk562_merged.fastq.gz')
+} else {
+  fq_files <- file.path(fastq_dir,sprintf('%s_merged.fastq.gz', plateid))
+}
+barcode_df.raw = read_fastq_gz(fq_files)
+```
+raw read stats: include reads from both wells. 
+```{r}
+head(barcode_df.raw)
+# 1,649,882 uniq reads, total 21,877,770
+print(dim(barcode_df.raw))
+# [1] 1649882      2
+plate_stats[['raw_reads_uniq']] <- dim(barcode_df.raw)[1]
+sum(barcode_df.raw$freq)
+# [1] 21877770
+plate_stats[['raw_reads']] <- sum(barcode_df.raw$freq)
+
+# remove cov<2
+sum(barcode_df.raw$freq<=1)
+# [1] 1153419
+# after filtering: 496,463 uniq reads, total 20724351 reads.
+barcode_df <- barcode_df.raw[barcode_df.raw$freq>1,]
+dim(barcode_df)
+# [1] 496463      2
+plate_stats[['raw_read_cov>1_uniq']] <- dim(barcode_df)[1]
+sum(barcode_df$freq)
+# 20,724,351
+plate_stats[['raw_read_cov>1']] <- sum(barcode_df$freq)
+rm(barcode_df.raw)
+```
+
+## 2.2 detect unique reads matching sample_tags, constants and bc pattern backbones.
+We already knew one well (H7) has failed the illumina indexing. Rest of the works will be solely on H8.
+```{r}
+well_stats <- c()
+# sample 1 has no match - as already known
+csv_row <- 2
+### 2.2.1 select a well to analysis
+process_stats <- c()
+wellid <- df.csv[csv_row,1]
+
+# "CTTGAGTAG"
+sample_tag1 <- df.csv[csv_row,2]
+# "GGCCTCTTCCGCGTCTTC"
+const1 <- toupper(df.csv[csv_row,3])
+sample_tag2 <- df.csv[csv_row,4]
+const2 <- df.csv[csv_row,5]
+# CCTAATGGA
+sample_tag2.rc <- as.character(reverseComplement(DNAString(x=sample_tag2)))
+# TCTGTTGTTTGCCCCTCCC
+const2.rc = toupper(as.character(reverseComplement(DNAString(x=const2))))
+# barcode only pattern
+# pattern = "GCTC([ACTG]{3})CAG([ACTG]{3})GTT([ACTG]{3})ACT([ACTG]{3})CTC([ACTG]{3})AGG([ACTG]{3})GAC([ACTG]{3})GAGCGGT"
+pattern.read = paste(sample_tag1,const1,"(.*)GCTC([ACTG]{3})CAG([ACTG]{3})GTT([ACTG]{3})ACT([ACTG]{3})CTC([ACTG]{3})AGG([ACTG]{3})GAC([ACTG]{3})GAGCGGT(.*)",const2.rc,sample_tag2.rc,sep = "")
+pattern.read
+# [1] "CTTGAGTAGGGCCTCTTCCGCGTCTTC(.*)GCTC([ACTG]{3})CAG([ACTG]{3})GTT([ACTG]{3})ACT([ACTG]{3})CTC([ACTG]{3})AGG([ACTG]{3})GAC([ACTG]{3})GAGCGGT(.*)TCTGTTGTTTGCCCCTCCCCCTAATGGA"
+process_stats[['wellid']] <- wellid
+
+### 2.2.2: fwd reads
+matched_reads.fwd <- bc_extract_df(barcode_df, pattern.read, maxLDist = 0)
+
+process_stats[['fwd.match_reads']] <- sum(matched_reads.fwd$count)
+
+process_stats[['fwd.match_reads_uniq']] <- dim(matched_reads.fwd)[1]
+
+
+### 2.2.3 rev reads
+rc <- as.character(reverseComplement(DNAStringSet(x=barcode_df$seq)))
+barcode_df.rc = barcode_df
+barcode_df.rc$seq= rc
+
+matched_reads.rc <- bc_extract_df(barcode_df.rc, pattern.read, maxLDist = 0)
+process_stats[['rc.match_reads']] <- sum(matched_reads.rc$count)
+
+# dim(matched_reads.rc)
+# [1] 913   2
+process_stats[['rc.match_reads_uniq']] <- dim(matched_reads.rc)[1]
+
+### 2.2.4. merge fwd + rc reads
+matched_reads.merged <- merge(matched_reads.fwd, matched_reads.rc, by.x="barcode_seq", by.y="barcode_seq", all.x=T, all.y=T)
+matched_reads.merged$count.x[is.na(matched_reads.merged$count.x)]=0
+matched_reads.merged$count.y[is.na(matched_reads.merged$count.y)]=0
+matched_reads.merged$count.fwdrc <- matched_reads.merged$count.x + matched_reads.merged$count.y
+matched_reads.merged <- matched_reads.merged[order(matched_reads.merged$count.fwdrc, decreasing = T),]
+process_stats[['fwdrc.match_reads']]=sum(matched_reads.merged$count.fwdrc)
+
+# dim(matched_reads.merged)
+# [1] 1215    4
+process_stats[['fwdrc.match_reads_uniq']] = dim(matched_reads.merged)[1]
+# matched_reads.merged[1,]
+# barcode_seq
+#                                                                                                                                                                                            <char>
+# 1: CTTGAGTAGGGCCTCTTCCGCGTCTTCGCCTTCGCCCTCAGACGAGTCGGATCTCCCTTTGGGCCGCCTCCCCGCCTTTGCTAGTCTACGCTCAGTCAGTGAGTTCGTACTATGCTCTTCAGGTATGACTAAGAGCGGTCTGTGCCTTCTAGTTGCCAGCCATCTGTTGTTTGCCCCTCCCCCTAATGGA
+#    count.x count.y count.fwdrc
+#      <num>   <num>       <num>
+# 1:    1576    1651        3227
+```
+
+## 2.3 extract exact matching barcodes from merged reads
+```{r}
+# We expect each read contains a valid barcode.
+
+matched_reads.merged <- matched_reads.merged[,c('barcode_seq', "count.fwdrc")]
+colnames(matched_reads.merged) <- c('seq','freq')
+# input detected reads for barcode detection
+pattern.bc = "GCTC([ACTG]{3})CAG([ACTG]{3})GTT([ACTG]{3})ACT([ACTG]{3})CTC([ACTG]{3})AGG([ACTG]{3})GAC([ACTG]{3})GAGCGGT"
+df.bc_backbone <- bc_extract_df(matched_reads.merged, pattern.bc, maxLDist = 0)
+  #                                           barcode_seq count
+  #                                                <char> <num>
+  # 1: GCTCTGGCAGTGCGTTAAGACTTTGCTCGTTAGGATGGACTTGGAGCGGT 21928
+  # 2: GCTCCAGCAGCTAGTTTCGACTTCTCTCATAAGGTTAGACAATGAGCGGT 16935
+process_stats[['match_bc.reads']] <- sum(df.bc_backbone$count)
+
+# found 555 barcodes before clustering
+# dim(df.bc_backbone)
+# [1] 555   2
+process_stats[['match_bc.bcs']] <- dim(df.bc_backbone)[1]
+if (OUTPUT) {
+  # output reads and counts as csv.
+  if(!dir.exists(sprintf('%s/k562/run1/bc_extract/%s', analysis_root,plateid))){
+    dir.create(sprintf('%s/k562/run1/bc_extract/%s', analysis_root,plateid), recursive = T)
+  }
+  
+  # all barcode detected from k562 cell line
+  write.csv(df.bc_backbone, 
+            file=sprintf('%s/k562/run1/bc_extract/%s.bc.csv', analysis_root, wellid),
+            row.names = F)
+}
+```
+
+## 3. matching k562 barcodes to whitelist bc (potential barcodes from plate1-5) with Ld<=1
+load whitelist bc
+```{r}
+df.whitelist <- read.csv(file=sprintf('%s/run2/plate1-5.final_bc_potential.csv', analysis_root), 
+         sep = ',', header = F)
+colnames(df.whitelist) <- c('bc', 'wellid')
+```
+match k562 df.bc_backbone to whitelist, allowing ld=1
+```{r}
+# for each k562 bc, compute the distance to whitelist, merge if ld<=1
+# row: whitelist, col: k562 barcodes.
+df.ld <- data.frame(lapply(df.bc_backbone$barcode_seq, function(x){stringdist(df.whitelist$bc, x, method = 'lv')} ))
+colnames(df.ld) <- df.bc_backbone$barcode_seq
+if (OUTPUT) {
+save(df.ld, df.whitelist, df.bc_backbone,file=sprintf('%s/K562/run1/Ld.RData', analysis_root))
+}
+
+load(file=sprintf('%s/k562/run1/Ld.RData', analysis_root), verbose = T)
+df.bc_mapped_to_whitelist <- data.frame(whitelist=df.whitelist$bc, 
+                                        wellid=df.whitelist$wellid, 
+                                        reads=0,k562_bc="")
+
+for (row in 1:nrow(df.bc_mapped_to_whitelist)){
+  if(sum(df.ld[row,]<=1)>0){
+    matched_bc.seq <- df.bc_backbone$barcode_seq[df.ld[row,]<=1]
+    matched_bc.counts <- df.bc_backbone$count[df.ld[row,]<=1]
+    matched_bc.Ld <- df.ld[row,][df.ld[row,]<=1]
+    # remove matched_bc
+    df.ld[row,df.ld[row,]<=1]=1000
+    str1 <- ''
+    for (i in 1:length(matched_bc.seq)){
+      str1 <- sprintf('%s%s:%d:%d;',str1,matched_bc.seq[i],matched_bc.Ld[i],matched_bc.counts[i])
+    }
+    df.bc_mapped_to_whitelist[row,"reads"] <- sum(matched_bc.counts)
+    df.bc_mapped_to_whitelist[row,"k562_bc"] <- str1
+  }
+}
+write.csv(df.bc_mapped_to_whitelist, 
+            file=sprintf('%s/k562/run1/%s.match_whitelist.csv', analysis_root,wellid),
+            row.names = F, quote = F)
+```
+How many whitelist bc without NGS reads matching? How many NGS reads do not match to whitelist?
+
+```{r}
+# How many whitelist bc without NGS reads matching?
+sum(df.bc_mapped_to_whitelist$reads==0)
+# [1] 21
+# How many NGS reads do not match to whitelist?
+load(file=sprintf('%s/k562/Ld.RData', analysis_root), verbose = T)
+k562.not_wl_match_bc <- c()
+for (col in 1:ncol(df.ld)){
+  if (sum(df.ld[,col]<=1)==0){
+    k562.not_wl_match_bc <- c(k562.not_wl_match_bc, col)
+  }
+  
+}
+```
