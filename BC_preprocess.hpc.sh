@@ -1,12 +1,14 @@
-# v2: this is the tidied up and later version of 
+# Author: Yuxuan Lan; yuxuan.lan@earlham.ac.uk
+
+# this is the tidied up and later version of this script
 # /Users/lany/mount_drives/HPC_Projects/0/0ddcec61-75f4-4347-b696-e96ec587183c/data/results/YL/PIP-3583/Analysis/Barcode_analysis/run2/sbatch_barcode_detection.hpc.v2.sh
 
 projects_dir=/ei/projects/0/0ddcec61-75f4-4347-b696-e96ec587183c
 analysis_dir=$projects_dir/data/results/YL/PIP-3583/Analysis/Barcode_analysis
-plateid=plate6
-plateid_old=plate6fullLIBk562
+# plateid=plate6
+# plateid_old=plate6fullLIBk562
 
-# ===== 1. merge and subsample =====
+# ===== 1. merge R1 and R2 reads =====
 if true; then
     # make symlink of the raw data
     if true; then

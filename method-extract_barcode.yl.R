@@ -1,4 +1,5 @@
-# modified version of cellbarcode
+# modified version of cellbarcode to use in Barcode_library_pipeline
+#  old name: method-extract_barcode.yl1.R
 library(CellBarcode)
 library(magrittr)
 library(stringr)
