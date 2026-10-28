@@ -1,0 +1,337 @@
+---
+title: "Detect RNA barcodes using cellbarcode package on plate6 k562 data: "
+date: "2026-10-13"
+author: "Yuxuan Lan"
+output: html_document
+html_document: default
+pdf_document: default
+---
+
+# post_run_K562.Rmd
+This is a cleaned up version of /Users/lany/mount_drives/HPC_Projects/0/0ddcec61-75f4-4347-b696-e96ec587183c/data/results/YL/PIP-3583/Analysis/CellBarcode_3.22/plate_UMI_constant/post.run1_K562_v3.Rmd
+
+Version history
+
+v3: as post.run1_K562_v3.Rmd
+output to K562/run1/v3
+1. find K562 bcs in whitelist (d<=1)
+2. find K562 bcs not in whitelist 
+3. filter K562 bcs step2 on coverage >=100 -> produce a list of unique BC with high confidence
+4. for confident unique barcodes, search plate1-5 raw barcode for match (d<=2)
+
+v2: as post.run_K562_v1.v2.Rmd
+1. find K562 bcs in whitelist
+2. find K562 bcs not in whitelist 
+3. filter K562 bcs step2 on coverage >=100 -> produce a list of unique BC with high confidence
+
+v1: 
+Post analysis following /ei/projects/0/0ddcec61-75f4-4347-b696-e96ec587183c/data/results/YL/PIP-3583/Analysis/CellBarcode_3.22/plate_UMI_constant/run_K562.v1.Rmd
+
+run1/ read and barcode matching with dist=0
+
+Start on 0/0ddcec61-75f4-4347-b696-e96ec587183c/data/results/YL/PIP-3583/Analysis/CellBarcode_3.22/plate_UMI_constant/K562/run1/plate6_H8.match_whitelist.csv; filter all detected barcodes to remove freq<100. 
+Output to run1/filter100/
+
+1. find K562 bcs in whitelist
+2. find K562 bcs not in whitelist - unique to K562
+3. filter K562 bcs on coverage >=100
+4. repeat step 1 and 2.
+5. multiple sequence alignment for reads in plate 1-5 associated with top unique K562 bc.
+
+```{r}
+# if (!require("BiocManager", quietly = TRUE))
+#     install.packages("BiocManager")
+# BiocManager::install("CellBarcode")
+rm(list=ls())
+library(CellBarcode)
+library(magrittr)
+library(stringr)
+library(dplyr)
+library(stringdist)
+# install.packages("data.table") # for testing cellbarcode
+library(data.table)
+library(Biostrings)
+source('/Users/lany/mount_drives/HPC_Projects/0/0ddcec61-75f4-4347-b696-e96ec587183c/data/results/YL/PIP-3583/Software/CellBarcode-v1.13.2/method-extract_barcode.yl1.R')
+library(ggplot2)
+#Clear out R before starting anything
+
+fastq_dir="/Users/lany/mount_drives/HPC_Projects/0/0ddcec61-75f4-4347-b696-e96ec587183c/data/results/YL/PIP-3583/Reads/Raw_merged/"
+analysis_root <- "/Users/lany/mount_drives/HPC_Projects/0/0ddcec61-75f4-4347-b696-e96ec587183c/data/results/YL/PIP-3583/Analysis/CellBarcode_3.22/plate_UMI_constant"
+
+plateid <- "k562"
+maxLDist <- 3
+# this stores all process status for each well
+plate_stats <- c()
+
+OUTPUT=F
+```
+## 1. Unfiltered barcodes, compare to whitelist
+load K562 detected barcodes
+```{r}
+
+load(file=sprintf('%s/k562/run1/Ld.RData', analysis_root), verbose = T)
+# Loading objects:
+#   df.ld
+#   df.whitelist
+#   df.bc_backbone
+sum(df.bc_backbone$count)
+# [1] 1082306
+```
+### 1.2. How many whitelist barcodes are found the k562 bc?
+```{r}
+# compute distance matrix
+df.ld <- data.frame(lapply(df.bc_backbone$barcode_seq, function(x){stringdist(df.whitelist$bc, x, method = 'lv')} ))
+
+colnames(df.ld) <- df.bc_backbone$barcode_seq
+if (OUTPUT) {
+save(df.ld, df.whitelist, df.bc_backbone,file=sprintf('%s/K562/run1/Ld.RData', analysis_root))
+}
+dim(df.ld)
+# [1] 1261 5872
+
+df.bc_mapped_to_whitelist <- data.frame(whitelist=df.whitelist$bc, 
+                                        wellid=df.whitelist$wellid, 
+                                        reads=0,k562_bc="")
+
+for (row in 1:nrow(df.bc_mapped_to_whitelist)){
+  if(sum(df.ld[row,]<=1)>0){
+    matched_bc.seq <- df.bc_backbone$barcode_seq[df.ld[row,]<=1]
+    matched_bc.counts <- df.bc_backbone$count[df.ld[row,]<=1]
+    matched_bc.Ld <- df.ld[row,][df.ld[row,]<=1]
+    # remove matched_bc
+    df.ld[row,df.ld[row,]<=1]=1000
+    str1 <- ''
+    for (i in 1:length(matched_bc.seq)){
+      str1 <- sprintf('%s%s:%d:%d;',str1,matched_bc.seq[i],matched_bc.Ld[i],matched_bc.counts[i])
+    }
+    df.bc_mapped_to_whitelist[row,"reads"] <- sum(matched_bc.counts)
+    df.bc_mapped_to_whitelist[row,"k562_bc"] <- str1
+  }
+}
+# number of bcs matching whitelist (inc with d=1)
+sum(df.ld==1000)
+# [1] 2637
+
+# how many whitelist bc without NGS support? 
+sum(df.bc_mapped_to_whitelist$reads==0)
+# [1] 21
+
+if (OUTPUT){
+  save(df.ld, df.whitelist,df.bc_mapped_to_whitelist,
+       df.bc_backbone,file=sprintf('%s/k562/run1/Ld.post_matching.RData', analysis_root))
+  write.csv(df.bc_mapped_to_whitelist, 
+            file=sprintf('%s/k562/run1/match_whitelist.csv', analysis_root),
+            row.names = F, quote = F)
+}
+```
+### 1.3. Many hight freq NGS barcodes do not match to whitelist (3236 bcs in total). 
+Note that some will have mismatches to barcode patterns.
+```{r}
+# many NGS reads do not match to whitelist
+load(file=sprintf('%s/k562/run1/Ld.RData', analysis_root), verbose = T)
+dim(df.ld)
+# [1] 1261 5872: row - whitelist, col - k562
+k562.not_wl_match_bc <- data.frame()
+idx <- c()
+for (col in 1:ncol(df.ld)){
+  if (sum(df.ld[,col]<=1)==0){
+    idx <- c(idx, colnames(df.ld)[col])
+  }
+}
+k562.not_wl_match_bc <- data.frame(bc=idx)
+k562.not_wl_match_bc$freq <- unname(sapply(idx, FUN=function(x)
+  df.bc_backbone$count[df.bc_backbone$barcode_seq==x]))
+if (OUTPUT) {
+  write.csv(k562.not_wl_match_bc, 
+            file=sprintf('%s/k562/run1/NGS_bc_not_match_wl.csv', analysis_root),
+            row.names = F, quote = F)
+}
+# num bc not in white list
+dim(k562.not_wl_match_bc)
+# [1] 3236    2
+```
+
+## 2. filter to remove low freq unique barcodes: 3236 -> 1054.
+
+```{r}
+k562.not_wl_match_bc.filtered <- k562.not_wl_match_bc[k562.not_wl_match_bc$freq>=100,]
+sum(k562.not_wl_match_bc.filtered$freq)
+# [1] 548,883 reads
+dim(k562.not_wl_match_bc.filtered)
+# [1] 1054    2
+if (OUTPUT) {
+  write.csv(k562.not_wl_match_bc.filtered, 
+            file=sprintf('%s/k562/run1/NGS_bc_not_match_wl.filter100.csv', analysis_root),
+            row.names = F, quote = F)
+}
+```
+how similar are the unique barcode to whitelist
+
+```{r}
+df.ld.k562bc_not_in_w.filtered <- df.ld[,k562.not_wl_match_bc.filtered$bc]
+dim(df.ld.k562bc_not_in_w.filtered)
+# [1] 1261 1054
+
+# minimum edit dist of each barcode to whitelist
+min_d <- data.frame(d=unlist( sapply(df.ld.k562bc_not_in_w.filtered, FUN = min)))
+dim(min_d)
+# [1] 1054    1
+df.hist <- min_d |> group_by(d) |> count()
+df.hist
+
+```
+how similar are the K562 barcodes amounts themselves?
+```{r}
+df.ld_bc_vs_bc <- data.frame(lapply(colnames(df.ld), function(x){stringdist(colnames(df.ld), x, method = 'lv')} ))
+dim(df.ld_bc_vs_bc)
+# [1] 5872 5872
+colnames(df.ld_bc_vs_bc) <- colnames(df.ld)
+rownames(df.ld_bc_vs_bc) <- colnames(df.ld)
+if (OUTPUT) {
+  save(df.ld_bc_vs_bc, file=sprintf('%s/k562/run1/Ld.k562bc_vs_bc.RData', analysis_root))
+
+}
+
+# d(i,i)=100
+for (i in 1:nrow(df.ld_bc_vs_bc)) {
+  j=i
+  df.ld_bc_vs_bc[i,j] <- 100
+}
+min_d <- data.frame(d=unlist( sapply(df.ld_bc_vs_bc, FUN = min)))
+df.hist <- min_d |> group_by(d) |> count()
+df.hist
+#        d     n
+#    <dbl> <int>
+#  1     1  4478
+#  2     2   179
+#  3     3   111
+#  4     4   132
+#  5     5   118
+#  6     6   189
+#  7     7   336
+#  8     8   281
+#  9     9    46
+# 10    10     2
+```
+histgram of distance between K562 raw barcode to whitelist. Shows two raw barcode populations.
+One matches whitelist, one unique to themselves. 
+```{r}
+
+load(file=sprintf('%s/k562/run1/Ld.RData', analysis_root), verbose = T)
+min_d <- data.frame(d=unlist( sapply(df.ld, FUN = min)))
+df.hist.2 <- min_d |> group_by(d) |> count()
+df.hist.2
+p <- ggplot(data=df.hist.2, aes(x=d, y=n))+geom_bar(stat="identity")+
+  ggtitle("edit dist(K562_raw_bc, whitelist)")
+p
+```
+For the unique population, cluster the barcodes from k562.not_wl_match_bc (not filtered): 
+```{r}
+# the sequences are already in descending order of the count, so it is safe to merge
+bc_cluster.count <- c()
+bc_cluster.bc <- c()
+
+k562.not_wl_match_bc.2 = k562.not_wl_match_bc|>arrange(desc(freq))
+head(k562.not_wl_match_bc.2,1)
+#                                                   bc freq
+# 1 GCTCAGTCAGTGAGTTCGTACTATGCTCTTCAGGTATGACTAAGAGCGGT 3423
+# compute d amounst unique barcodes
+df.ld_unique_k562 <- data.frame(lapply(k562.not_wl_match_bc.2$bc,
+                                       function(x){stringdist(k562.not_wl_match_bc.2$bc, x, method = 'lv')} ))
+dim(df.ld_unique_k562)
+# [1] 3236 3236
+
+# start with all barcodes, end of each search set count for merged barcode to 0
+for (row in 1:dim(df.ld_unique_k562)[1]){
+  current_bc <- k562.not_wl_match_bc.2$bc[row]
+  if (k562.not_wl_match_bc.2$freq[row]>0){
+    idx_to_merge <- which(df.ld_unique_k562[row,]<=1)
+    bc_cluster.count <- c(bc_cluster.count, sum(k562.not_wl_match_bc.2$freq[idx_to_merge]))
+    bc_cluster.bc <- c(bc_cluster.bc, current_bc)
+    k562.not_wl_match_bc.2$freq[idx_to_merge] = 0
+  } 
+}
+
+df.unique_bc_clustered <- data.frame(barcode_seq = bc_cluster.bc, freq = bc_cluster.count)
+# sum(df.bc_clustered$count)
+df.unique_bc_clustered <- df.unique_bc_clustered[order(df.unique_bc_clustered$freq, decreasing = T),]
+df.unique_bc_clustered.filtered <- df.unique_bc_clustered[df.unique_bc_clustered$freq>=100,]
+
+if (OUTPUT) {
+  write.csv(df.unique_bc_clustered, 
+            file=sprintf('%s/k562/run1/K562_unique_bc.clustered.csv', analysis_root),
+            row.names = F, quote = F)
+  write.csv(df.unique_bc_clustered.filtered, 
+            file=sprintf('%s/k562/run1/K562_unique_bc.clustered.filtered.csv', analysis_root),
+            row.names = F, quote = F)
+}
+```
+histogram of distance amounts filtered unique bc - sufficient.
+```{r}
+df.ld_unique_k562.filtered <- data.frame(lapply(df.unique_bc_clustered.filtered$barcode_seq,
+                                       function(x){stringdist(df.unique_bc_clustered.filtered$barcode_seq, 
+                                                              x, method = 'lv')} ))
+dim(df.ld_unique_k562.filtered)
+# [1] 1026 1026
+for (i in 1:nrow(df.ld_unique_k562.filtered)){
+  df.ld_unique_k562.filtered[i,i] <- 100
+}
+min_d <- data.frame(d=unlist( sapply(df.ld_unique_k562.filtered, FUN = min)))
+df.hist.3 <- min_d |> group_by(d) |> count()
+df.hist.3
+p <- ggplot(data=df.hist.3, aes(x=d, y=n))+geom_bar(stat="identity")+
+  ggtitle("edit dist amongst 1026 filtered_unique_bc")
+p
+```
+
+## 3. search plate1-5 bc_extract/, looking for bc matching filtered unique barcodes with d<=2.
+### 3.2. output to df 
+```{r}
+bc.K562_unique <- read.csv(file=sprintf('%s/k562/run1/K562_unique_bc.clustered.filtered.csv', analysis_root))
+rownames(bc.K562_unique) <- bc.K562_unique$barcode_seq
+# head(bc.K562_unique)
+#                                          barcode_seq freq
+# 1 GCTCAGTCAGTGAGTTCGTACTATGCTCTTCAGGTATGACTAAGAGCGGT 3471
+# 2 GCTCCTACAGAACGTTAAAACTTTACTCGACAGGAAGGACAAAGAGCGGT 2689
+
+plate <- "plate1"
+
+df.match_bc <- data.frame(matrix(data=NA, nrow=0, ncol=6))
+colnames(df.match_bc) <- c("d","well_id","wellbc","wellbc.freq","k562_bc","k562_bc.freq")
+
+# loop through each well on the plate
+csvlist <- list.files(path=file.path(analysis_root, 'run2/bc_extract/', plate), 
+           pattern = ".bc.csv")
+for (csvname in csvlist) {
+  print(csvname)
+  # csvname <- csvlist[1]
+  df.wellbc <- read.csv(file =file.path(analysis_root, 'run2/bc_extract/', plate, csvname))
+  # row: wellbc, col: K562 bc
+  df.ld <- data.frame(lapply(bc.K562_unique$barcode_seq, function(x){stringdist(df.wellbc$barcode_seq, x, method = 'lv')} ))
+  # search each row (wellbc) to find matching bc
+  for (id.wellbc in 1:nrow(df.ld)){
+    id.k562bc <- which(df.ld[id.wellbc,]<=2)
+    if (length(id.k562bc)>0) {
+      tmp.df <- data.frame(d=unlist(unname(as.vector(df.ld[id.wellbc,id.k562bc]))),
+                           well_id=rep(str_remove(csvname, '.bc.csv'),length(id.k562bc)), 
+                           wellbc=rep(df.wellbc$barcode_seq[id.wellbc], length(id.k562bc)),
+                           wellbc.freq=rep(df.wellbc$count[id.wellbc], length(id.k562bc)),
+                           k562_bc=bc.K562_unique$barcode_seq[id.k562bc],
+                           k562_bc.freq=bc.K562_unique$freq[id.k562bc]
+                           )
+      df.match_bc <- rbind(df.match_bc, tmp.df)
+    }
+  }
+}
+if (OUTPUT) {
+  save(df.match_bc, bc.K562_unique, 
+     file = sprintf('%s/K562/run1/v3/%s.rawbc_match_K562_unique_bc.Rdata', analysis_root, plate))
+    # output matching to csv format
+  for (plate in c("plate1","plate2","plate3","plate4","plate5")) {
+    load(file = sprintf('%s/K562/run1/v3/%s.rawbc_match_K562_unique_bc.Rdata', 
+                        analysis_root, plate), verbose = T)
+    write.csv(df.match_bc, quote = F,
+              file = sprintf('%s/K562/run1/v3/%s.rawbc_match_K562_unique_bc.csv', analysis_root, plate))
+  }
+}
+```

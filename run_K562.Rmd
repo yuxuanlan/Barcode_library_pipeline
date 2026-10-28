@@ -7,7 +7,13 @@ html_document: default
 pdf_document: default
 ---
 
-# V1: this is based on run_CellBarcode.v3.Rmd.
+# run_K562.Rmd
+
+This is a cleaned up version of /Users/lany/mount_drives/HPC_Projects/0/0ddcec61-75f4-4347-b696-e96ec587183c/data/results/YL/PIP-3583/Analysis/CellBarcode_3.22/plate_UMI_constant/run_K562.v1.Rmd
+
+Version history:
+
+V1: this is based on run_CellBarcode.v3.Rmd.
 
 This version uses plate+wellid UMI and constant + barcode patterns.
 
@@ -16,6 +22,7 @@ Detect and cluster barcodes for whole plate. Results go under ./k562/run1/
 call bc_extract_df() with default maxLDist=0. This only detect barcodes with full match to pattern.
 
 Modified and re-ran: 05-Oct-2026
+
 Prepare package for usage
 
 ```{r}
